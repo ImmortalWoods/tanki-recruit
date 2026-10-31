@@ -4,7 +4,7 @@ import json
 import argparse
 import time
 import sqlite3
-import fcntl
+from platform_bits import lock_file
 from login import DATA_DIR
 from login import PAGE_URL, PROFILES_DIR
 from playwright.sync_api import sync_playwright
@@ -28,11 +28,7 @@ def main():
     if args.limit < 1:
         parser.error('--limit должен быть положительным')
     DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock = open(DATA_DIR / 'recruit.lock', 'w')
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise SystemExit('Другой запуск уже работает')
+    lock = lock_file(DATA_DIR / 'recruit.lock')
     db = sqlite3.connect(DATA_DIR / 'invitations.sqlite3')
     db.execute('CREATE TABLE IF NOT EXISTS invitations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
     db.commit()

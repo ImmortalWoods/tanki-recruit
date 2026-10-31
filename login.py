@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Ручной вход в Lesta с отдельным постоянным профилем Chromium."""
-import os
 import re
 import sys
-from pathlib import Path
 from urllib.parse import urlsplit
+from platform_bits import data_dir
 
 PAGE_URL = 'https://lesta.ru/clans/wot/recruit_members/'
-DATA_DIR = Path(os.environ.get('TANKI_RECRUIT_DATA', Path.home() / '.local/share/tanki-recruit'))
+DATA_DIR = data_dir()
 PROFILES_DIR = DATA_DIR / 'profiles'
 
 
