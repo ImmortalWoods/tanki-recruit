@@ -22,7 +22,7 @@ OnFailure=tanki-recruit-failure.service
 Type=oneshot
 WorkingDirectory=$project_dir
 ExecStart="$python_bin" -u "$project_dir/candidates.py" --send
-TimeoutStartSec=15min
+TimeoutStartSec=infinity
 EOF
 cat > "$unit_dir/tanki-recruit.timer" <<'EOF'
 [Unit]

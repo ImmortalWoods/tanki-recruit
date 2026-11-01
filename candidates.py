@@ -74,13 +74,10 @@ def player_invitations(page, player_id):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--send', action='store_true', help='отправить приглашения найденным игрокам')
-    parser.add_argument('--limit', type=int, default=10, help='максимум приглашений за запуск (по умолчанию 10)')
     parser.add_argument('--pending', action='store_true', help='показать неоднозначные попытки')
     parser.add_argument('--resolve-pending', type=int, metavar='ID', help='разрешить неоднозначную попытку после проверки на сайте')
     parser.add_argument('--resolution', choices=('sent', 'retry'), help='sent: приглашение найдено; retry: его нет и можно повторить')
     args = parser.parse_args()
-    if args.limit < 1:
-        parser.error('--limit должен быть положительным')
     if (args.resolve_pending is None) != (args.resolution is None):
         parser.error('--resolve-pending и --resolution используются вместе')
     if (args.pending or args.resolve_pending is not None) and args.send:
@@ -168,7 +165,7 @@ def main():
                     matched += 1
                     player = data['all']
                     emit(json.dumps({'id': player['id'], 'name': player['account']['name'], 'battles': battles, 'wins_percent': round(wins, 2), 'battles_28_days': recent_battles, 'per_day': round(recent_battles / PERIOD_DAYS, 2)}, ensure_ascii=False), flush=True)
-                    if args.send and sent < args.limit:
+                    if args.send:
                         if not page.evaluate("document.cookie.split('; ').some(x => x.startsWith('csrftoken='))"):
                             raise RuntimeError('Не найден CSRF-токен; повторите вход')
                         before = player_invitations(page, player['id'])
