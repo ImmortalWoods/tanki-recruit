@@ -24,9 +24,9 @@ PAGE_SIZE = 100
 MAX_PAGES = 100
 
 
-def invitation_ids(page, player_id):
-    """Получить ID приглашений игрока из списка клана; ошибка означает неопределённость."""
-    ids = set()
+def player_invitations(page, player_id):
+    """Получить ID и статусы приглашений игрока; ошибка означает неопределённость."""
+    invitations = {}
     offset = 0
     total = None
     while total is None or offset < total:
@@ -49,9 +49,12 @@ def invitation_ids(page, player_id):
             if not isinstance(invite, dict) or type(invite.get('id')) is not int or not isinstance(invite.get('account'), dict) or type(invite['account'].get('id')) is not int:
                 raise RuntimeError('Неполные данные списка приглашений')
             if invite['account']['id'] == player_id:
-                ids.add(invite['id'])
+                status = invite.get('status')
+                if status not in ('active', 'expired', 'declined', 'accepted'):
+                    raise RuntimeError(f'Неизвестный статус приглашения игрока {player_id}: {status!r}')
+                invitations[invite['id']] = status
         offset += len(invites)
-    return ids
+    return invitations
 
 
 def main():
@@ -149,13 +152,13 @@ def main():
                     player = data['all']
                     print(json.dumps({'name': player['account']['name'], 'battles': battles, 'wins_percent': round(wins, 2), 'battles_28_days': recent_battles, 'per_day': round(recent_battles / PERIOD_DAYS, 2)}, ensure_ascii=False), flush=True)
                     if args.send and sent < args.limit:
-                        if db.execute('SELECT 1 FROM invitations WHERE id = ?', (player['id'],)).fetchone():
-                            print('Уже обработан ранее:', player['account']['name'], flush=True)
-                            continue
                         if not page.evaluate("document.cookie.split('; ').some(x => x.startsWith('csrftoken='))"):
                             raise RuntimeError('Не найден CSRF-токен; повторите вход')
-                        before = invitation_ids(page, player['id'])
-                        db.execute('INSERT INTO invitations (id, name, status) VALUES (?, ?, ?)', (player['id'], player['account']['name'], 'pending'))
+                        before = player_invitations(page, player['id'])
+                        if 'active' in before.values():
+                            print('У игрока уже есть активное приглашение:', player['account']['name'], flush=True)
+                            continue
+                        db.execute("INSERT INTO invitations (id, name, status) VALUES (?, ?, 'pending') ON CONFLICT(id) DO UPDATE SET name = excluded.name, status = 'pending', created_at = CURRENT_TIMESTAMP", (player['id'], player['account']['name']))
                         db.commit()
                         outcome = page.evaluate('''async (id) => {
                           const token = document.cookie.split('; ').find(x => x.startsWith('csrftoken='))?.split('=').slice(1).join('=');
@@ -179,8 +182,8 @@ def main():
                             raise RuntimeError('Ответ отправки не является JSON; проверьте --pending')
                         if not isinstance(body, dict) or body.get('error') or body.get('errors') or body.get('detail'):
                             raise RuntimeError('Ответ отправки не подтверждает успех; проверьте --pending')
-                        after = invitation_ids(page, player['id'])
-                        if not after.difference(before):
+                        after = player_invitations(page, player['id'])
+                        if not (after.keys() - before.keys()):
                             raise RuntimeError('Новое приглашение не найдено в списке клана; проверьте --pending')
                         db.execute('UPDATE invitations SET status = ? WHERE id = ?', ('sent', player['id']))
                         db.commit()
