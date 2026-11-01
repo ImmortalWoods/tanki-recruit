@@ -11,4 +11,4 @@ $trigger = New-ScheduledTaskTrigger -Daily -At '09:00'
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName 'TankiRecruit' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-Write-Host "Задача TankiRecruit установлена на 09:00. Журнал: $data\recruit.log"
+Write-Host "Задача TankiRecruit установлена на 09:00. Журнал: $project\logs; ошибки запуска: $data\recruit-errors.log"

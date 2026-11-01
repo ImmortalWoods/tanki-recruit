@@ -26,6 +26,9 @@ PAGE_SIZE = 100
 # даже после пустых страниц за его пределами могут оставаться игроки.
 MAX_PAGES = 100
 LOG_DIR = Path(__file__).resolve().parent / 'logs'
+RUN_MARKER = DATA_DIR / 'recruit-run.txt'
+RUN_LOCK = None
+RUN_STARTED = False
 
 
 def emit(*values, **kwargs):
@@ -34,7 +37,7 @@ def emit(*values, **kwargs):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     message = ' '.join(str(value) for value in values)
     with (LOG_DIR / now.strftime('%d.%m.%Y.log')).open('a', encoding='utf-8') as log:
-        log.write(f'{now.isoformat(timespec="seconds")} {message}\n')
+        log.write(f'{now:%d.%m.%Y %H:%M:%S}  {message}\n')
     print(*values, **kwargs)
 
 
@@ -83,7 +86,25 @@ def main():
     if (args.pending or args.resolve_pending is not None) and args.send:
         parser.error('управление незавершёнными попытками несовместимо с --send')
     DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock = lock_file(DATA_DIR / 'recruit.lock')
+    global RUN_LOCK, RUN_STARTED
+    RUN_LOCK = lock_file(DATA_DIR / 'recruit.lock')
+    previous = RUN_MARKER.read_text(encoding='utf-8').strip() if RUN_MARKER.exists() else None
+    RUN_MARKER.write_text(datetime.now().astimezone().isoformat(timespec='seconds'), encoding='utf-8')
+    RUN_STARTED = True
+    emit('=' * 48)
+    if previous:
+        emit(f'Внимание: предыдущий запуск ({previous}) не записал завершение; причина неизвестна.')
+    if args.pending:
+        mode = 'проверка незавершённых попыток'
+    elif args.resolve_pending is not None:
+        mode = 'разрешение незавершённой попытки'
+    elif args.send:
+        mode = 'поиск и отправка приглашений'
+    else:
+        mode = 'поиск без отправки'
+    emit('Запуск:', mode)
+    if not args.pending and args.resolve_pending is None:
+        emit(f'Критерии: от {MIN_BATTLES} боёв, победы от {MIN_WIN_PERCENT}%, от {MIN_BATTLES_PER_DAY} боёв/день за {PERIOD_DAYS} дней')
     db = sqlite3.connect(DATA_DIR / 'invitations.sqlite3')
     db.execute('CREATE TABLE IF NOT EXISTS invitations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
     db.commit()
@@ -144,7 +165,9 @@ def main():
                         if accounts and not ids.difference(seen):
                             raise RuntimeError(f'Сайт повторил страницу: уровень {level}, период {period}, offset {offset}')
                         seen.update(ids)
-                    emit(f'Уровень {level}, период {period}: {len(seen)} игроков, запросов {MAX_PAGES}', flush=True)
+                        if (page_number + 1) % 10 == 0 and page_number + 1 < MAX_PAGES:
+                            emit(f'Загрузка: уровень {level}, {"всё время" if period == "all" else "28 дней"}: страница {page_number + 1}/{MAX_PAGES}', flush=True)
+                    emit(f'Загружено: уровень {level}, {"всё время" if period == "all" else "28 дней"} — {len(seen)} игроков, страниц {MAX_PAGES}', flush=True)
             if not rows:
                 raise RuntimeError('Сайт не вернул ни одного кандидата; проверьте доступ и настройки набора')
             missing = [player_id for player_id, data in rows.items() if 'all' not in data or '28' not in data]
@@ -154,67 +177,83 @@ def main():
             if len(invalid) == len(rows):
                 raise RuntimeError('Нет кандидатов с полной статистикой за оба периода')
             sent = 0
-            matched = 0
             active_skipped = 0
+            matches = []
             for player_id, data in rows.items():
                 if player_id in invalid:
                     continue
                 lifetime, recent = data['all']['statistics'], data['28']['statistics']
                 battles, wins, recent_battles = lifetime['btl'], lifetime['wb'], recent['btl']
                 if battles >= MIN_BATTLES and wins >= MIN_WIN_PERCENT and recent_battles >= MIN_BATTLES_PER_DAY * PERIOD_DAYS:
-                    matched += 1
-                    player = data['all']
-                    emit(json.dumps({'id': player['id'], 'name': player['account']['name'], 'battles': battles, 'wins_percent': round(wins, 2), 'battles_28_days': recent_battles, 'per_day': round(recent_battles / PERIOD_DAYS, 2)}, ensure_ascii=False), flush=True)
-                    if args.send:
-                        if not page.evaluate("document.cookie.split('; ').some(x => x.startsWith('csrftoken='))"):
-                            raise RuntimeError('Не найден CSRF-токен; повторите вход')
-                        before = player_invitations(page, player['id'])
-                        if 'active' in before.values():
-                            active_skipped += 1
-                            emit('У игрока уже есть активное приглашение:', player['account']['name'], player['id'], flush=True)
-                            continue
-                        emit('Попытка отправки:', player['account']['name'], player['id'], 'предыдущие статусы:', ', '.join(sorted(set(before.values()))) or 'нет', flush=True)
-                        db.execute("INSERT INTO invitations (id, name, status) VALUES (?, ?, 'pending') ON CONFLICT(id) DO UPDATE SET name = excluded.name, status = 'pending', created_at = CURRENT_TIMESTAMP", (player['id'], player['account']['name']))
+                    matches.append((data['all'], battles, wins, recent_battles))
+            emit(f'Загрузка завершена: игроков {len(rows)}, подошло {len(matches)}, без полной статистики {len(invalid)}', flush=True)
+            for player, battles, wins, recent_battles in matches:
+                details = (f"{player['account']['name']} (ID {player['id']}) — боёв: {battles}, "
+                           f"побед: {wins:.2f}%, за {PERIOD_DAYS} дней: {recent_battles} "
+                           f"({recent_battles / PERIOD_DAYS:.2f} в день)")
+                if not args.send:
+                    emit('Подходит:', details, flush=True)
+                if args.send:
+                    if not page.evaluate("document.cookie.split('; ').some(x => x.startsWith('csrftoken='))"):
+                        raise RuntimeError('Не найден CSRF-токен; повторите вход')
+                    before = player_invitations(page, player['id'])
+                    if 'active' in before.values():
+                        active_skipped += 1
+                        emit('Пропущен — приглашение активно:', details, flush=True)
+                        continue
+                    status_names = {'expired': 'истекло', 'declined': 'отклонено', 'accepted': 'принято'}
+                    history = ', '.join(status_names[status] for status in sorted(set(before.values()))) or 'нет'
+                    emit(f'Отправка начата: {details}; предыдущие приглашения: {history}', flush=True)
+                    db.execute("INSERT INTO invitations (id, name, status) VALUES (?, ?, 'pending') ON CONFLICT(id) DO UPDATE SET name = excluded.name, status = 'pending', created_at = CURRENT_TIMESTAMP", (player['id'], player['account']['name']))
+                    db.commit()
+                    outcome = page.evaluate('''async (id) => {
+                      const token = document.cookie.split('; ').find(x => x.startsWith('csrftoken='))?.split('=').slice(1).join('=');
+                      if (!token) throw Error('Не найден CSRF-токен');
+                      const r = await fetch('/clans/wot/recruitstation/api/invites/', {
+                        method: 'POST', headers: {'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': decodeURIComponent(token)},
+                        body: JSON.stringify({comment: '', recipient_id: id, source: 'clans_portal.recruitstation'})
+                      });
+                      return {status: r.status, body: await r.text()};
+                    }''', player['id'])
+                    status = outcome['status']
+                    if 400 <= status < 500 and status not in (408, 409, 425):
+                        db.execute("DELETE FROM invitations WHERE id = ? AND status = 'pending'", (player['id'],))
                         db.commit()
-                        outcome = page.evaluate('''async (id) => {
-                          const token = document.cookie.split('; ').find(x => x.startsWith('csrftoken='))?.split('=').slice(1).join('=');
-                          if (!token) throw Error('Не найден CSRF-токен');
-                          const r = await fetch('/clans/wot/recruitstation/api/invites/', {
-                            method: 'POST', headers: {'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': decodeURIComponent(token)},
-                            body: JSON.stringify({comment: '', recipient_id: id, source: 'clans_portal.recruitstation'})
-                          });
-                          return {status: r.status, body: await r.text()};
-                        }''', player['id'])
-                        status = outcome['status']
-                        if 400 <= status < 500 and status not in (408, 409, 425):
-                            db.execute("DELETE FROM invitations WHERE id = ? AND status = 'pending'", (player['id'],))
-                            db.commit()
-                            raise RuntimeError(f'Сайт отклонил отправку: HTTP {status}')
-                        if status not in (200, 201):
-                            raise RuntimeError(f'Неоднозначный результат отправки: HTTP {status}; проверьте --pending')
-                        try:
-                            body = json.loads(outcome['body'])
-                        except (ValueError, TypeError):
-                            raise RuntimeError('Ответ отправки не является JSON; проверьте --pending')
-                        if not isinstance(body, dict) or body.get('error') or body.get('errors') or body.get('detail'):
-                            raise RuntimeError('Ответ отправки не подтверждает успех; проверьте --pending')
-                        after = player_invitations(page, player['id'])
-                        if not (after.keys() - before.keys()):
-                            raise RuntimeError('Новое приглашение не найдено в списке клана; проверьте --pending')
-                        db.execute('UPDATE invitations SET status = ? WHERE id = ?', ('sent', player['id']))
-                        db.commit()
-                        emit('Приглашение подтверждено:', player['account']['name'], player['id'], flush=True)
-                        sent += 1
-                        time.sleep(2)
-            emit(f'Итог: игроков {len(rows)}, подошло {matched}, отправлено {sent}, активных приглашений пропущено {active_skipped}, без полной статистики {len(invalid)}', flush=True)
+                        raise RuntimeError(f'Сайт отклонил отправку: HTTP {status}')
+                    if status not in (200, 201):
+                        raise RuntimeError(f'Неоднозначный результат отправки: HTTP {status}; проверьте --pending')
+                    try:
+                        body = json.loads(outcome['body'])
+                    except (ValueError, TypeError):
+                        raise RuntimeError('Ответ отправки не является JSON; проверьте --pending')
+                    if not isinstance(body, dict) or body.get('error') or body.get('errors') or body.get('detail'):
+                        raise RuntimeError('Ответ отправки не подтверждает успех; проверьте --pending')
+                    after = player_invitations(page, player['id'])
+                    if not (after.keys() - before.keys()):
+                        raise RuntimeError('Новое приглашение не найдено в списке клана; проверьте --pending')
+                    db.execute('UPDATE invitations SET status = ? WHERE id = ?', ('sent', player['id']))
+                    db.commit()
+                    emit(f'Приглашение подтверждено: {player["account"]["name"]} (ID {player["id"]})', flush=True)
+                    sent += 1
+                    time.sleep(2)
+            emit(f'Итог: игроков {len(rows)}, подошло {len(matches)}, отправлено {sent}, активных приглашений пропущено {active_skipped}, без полной статистики {len(invalid)}', flush=True)
         finally:
             browser.close()
 
 if __name__ == '__main__':
+    started = time.monotonic()
     try:
-        emit('Запуск:', ' '.join(sys.argv[1:]) or 'поиск без отправки', flush=True)
         main()
-        emit('Завершено успешно', flush=True)
-    except Exception as exc:
-        emit('Ошибка:', str(exc), file=sys.stderr, flush=True)
+        emit(f'Завершено успешно за {time.monotonic() - started:.0f} сек.', flush=True)
+    except KeyboardInterrupt:
+        if RUN_STARTED:
+            emit('Прервано пользователем. Если отправка была начата, проверьте --pending и список приглашений на сайте.', file=sys.stderr, flush=True)
         raise
+    except Exception as exc:
+        if RUN_STARTED:
+            emit('Ошибка:', str(exc), file=sys.stderr, flush=True)
+            emit('Если отправка была начата, проверьте --pending и список приглашений на сайте.', file=sys.stderr, flush=True)
+        raise
+    finally:
+        if RUN_STARTED:
+            RUN_MARKER.unlink(missing_ok=True)
