@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Поиск кандидатов и, по запросу, отправка приглашений."""
 import argparse
+from datetime import datetime
+from pathlib import Path
+import sys
 import json
 import math
 import sqlite3
@@ -22,6 +25,17 @@ PAGE_SIZE = 100
 # Сайт не возвращает общее число рекомендаций. Проверяется этот диапазон страниц;
 # даже после пустых страниц за его пределами могут оставаться игроки.
 MAX_PAGES = 100
+LOG_DIR = Path(__file__).resolve().parent / 'logs'
+
+
+def emit(*values, **kwargs):
+    """Вывести событие и сохранить его в ежедневном журнале по местному времени."""
+    now = datetime.now().astimezone()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    message = ' '.join(str(value) for value in values)
+    with (LOG_DIR / now.strftime('%d.%m.%Y.log')).open('a', encoding='utf-8') as log:
+        log.write(f'{now.isoformat(timespec="seconds")} {message}\n')
+    print(*values, **kwargs)
 
 
 def player_invitations(page, player_id):
@@ -84,14 +98,14 @@ def main():
         if cursor.rowcount != 1:
             raise RuntimeError('Незавершённая попытка с таким ID не найдена')
         db.commit()
-        print('Решение сохранено:', args.resolve_pending, args.resolution)
+        emit('Решение сохранено:', args.resolve_pending, args.resolution)
         return
     pending = db.execute("SELECT id, name, created_at FROM invitations WHERE status = 'pending' ORDER BY created_at").fetchall()
     if args.pending:
         for player_id, name, created in pending:
-            print(f'{player_id}\t{name}\t{created} UTC')
+            emit(f'{player_id}\t{name}\t{created} UTC')
         if not pending:
-            print('Незавершённых попыток нет')
+            emit('Незавершённых попыток нет')
         return
     if pending:
         raise RuntimeError('Есть незавершённые попытки. Выполните --pending и проверьте приглашения на сайте; инструкции в README.')
@@ -104,7 +118,7 @@ def main():
                 raise RuntimeError('Нужен повторный вход: python login.py main')
             rows = {}
             invalid = set()
-            print(f'Проверяется до {MAX_PAGES} страниц на каждый уровень и период; полный охват сайт не гарантирует.', flush=True)
+            emit(f'Проверяется до {MAX_PAGES} страниц на каждый уровень и период; полный охват сайт не гарантирует.', flush=True)
             for level in range(3):
                 for period in ('all', '28'):
                     seen = set()
@@ -133,31 +147,36 @@ def main():
                         if accounts and not ids.difference(seen):
                             raise RuntimeError(f'Сайт повторил страницу: уровень {level}, период {period}, offset {offset}')
                         seen.update(ids)
-                    print(f'Уровень {level}, период {period}: {len(seen)} игроков, запросов {MAX_PAGES}', flush=True)
+                    emit(f'Уровень {level}, период {period}: {len(seen)} игроков, запросов {MAX_PAGES}', flush=True)
             if not rows:
                 raise RuntimeError('Сайт не вернул ни одного кандидата; проверьте доступ и настройки набора')
             missing = [player_id for player_id, data in rows.items() if 'all' not in data or '28' not in data]
             invalid.update(missing)
             if invalid:
-                print(f'Пропущено игроков с неполной или некорректной статистикой: {len(invalid)}', flush=True)
+                emit(f'Пропущено игроков с неполной или некорректной статистикой: {len(invalid)}', flush=True)
             if len(invalid) == len(rows):
                 raise RuntimeError('Нет кандидатов с полной статистикой за оба периода')
             sent = 0
+            matched = 0
+            active_skipped = 0
             for player_id, data in rows.items():
                 if player_id in invalid:
                     continue
                 lifetime, recent = data['all']['statistics'], data['28']['statistics']
                 battles, wins, recent_battles = lifetime['btl'], lifetime['wb'], recent['btl']
                 if battles >= MIN_BATTLES and wins >= MIN_WIN_PERCENT and recent_battles >= MIN_BATTLES_PER_DAY * PERIOD_DAYS:
+                    matched += 1
                     player = data['all']
-                    print(json.dumps({'name': player['account']['name'], 'battles': battles, 'wins_percent': round(wins, 2), 'battles_28_days': recent_battles, 'per_day': round(recent_battles / PERIOD_DAYS, 2)}, ensure_ascii=False), flush=True)
+                    emit(json.dumps({'id': player['id'], 'name': player['account']['name'], 'battles': battles, 'wins_percent': round(wins, 2), 'battles_28_days': recent_battles, 'per_day': round(recent_battles / PERIOD_DAYS, 2)}, ensure_ascii=False), flush=True)
                     if args.send and sent < args.limit:
                         if not page.evaluate("document.cookie.split('; ').some(x => x.startsWith('csrftoken='))"):
                             raise RuntimeError('Не найден CSRF-токен; повторите вход')
                         before = player_invitations(page, player['id'])
                         if 'active' in before.values():
-                            print('У игрока уже есть активное приглашение:', player['account']['name'], flush=True)
+                            active_skipped += 1
+                            emit('У игрока уже есть активное приглашение:', player['account']['name'], player['id'], flush=True)
                             continue
+                        emit('Попытка отправки:', player['account']['name'], player['id'], 'предыдущие статусы:', ', '.join(sorted(set(before.values()))) or 'нет', flush=True)
                         db.execute("INSERT INTO invitations (id, name, status) VALUES (?, ?, 'pending') ON CONFLICT(id) DO UPDATE SET name = excluded.name, status = 'pending', created_at = CURRENT_TIMESTAMP", (player['id'], player['account']['name']))
                         db.commit()
                         outcome = page.evaluate('''async (id) => {
@@ -173,7 +192,7 @@ def main():
                         if 400 <= status < 500 and status not in (408, 409, 425):
                             db.execute("DELETE FROM invitations WHERE id = ? AND status = 'pending'", (player['id'],))
                             db.commit()
-                            raise RuntimeError(f'Сайт отклонил отправку: HTTP {status}: {outcome["body"]}')
+                            raise RuntimeError(f'Сайт отклонил отправку: HTTP {status}')
                         if status not in (200, 201):
                             raise RuntimeError(f'Неоднозначный результат отправки: HTTP {status}; проверьте --pending')
                         try:
@@ -187,11 +206,18 @@ def main():
                             raise RuntimeError('Новое приглашение не найдено в списке клана; проверьте --pending')
                         db.execute('UPDATE invitations SET status = ? WHERE id = ?', ('sent', player['id']))
                         db.commit()
-                        print('Приглашение подтверждено:', player['account']['name'], flush=True)
+                        emit('Приглашение подтверждено:', player['account']['name'], player['id'], flush=True)
                         sent += 1
                         time.sleep(2)
+            emit(f'Итог: игроков {len(rows)}, подошло {matched}, отправлено {sent}, активных приглашений пропущено {active_skipped}, без полной статистики {len(invalid)}', flush=True)
         finally:
             browser.close()
 
 if __name__ == '__main__':
-    main()
+    try:
+        emit('Запуск:', ' '.join(sys.argv[1:]) or 'поиск без отправки', flush=True)
+        main()
+        emit('Завершено успешно', flush=True)
+    except Exception as exc:
+        emit('Ошибка:', str(exc), file=sys.stderr, flush=True)
+        raise
